@@ -100,6 +100,17 @@ STORE_TYPE_ORDER = [
 ]
 STORE_TYPE_RANK = {t: i for i, t in enumerate(STORE_TYPE_ORDER)}
 
+SPECIAL_SIGNAGE_LABELS = [
+    ("Banner Sign", ("banner sign",)),
+    ("Yard Sign", ("yard sign",)),
+    ("A Frame", ("a frame", "a-frame")),
+    ("Bollard Cover", ("bollard cover",)),
+    ("Pole Sign", ("pole sign",)),
+    ("Easel Sign", ("easel sign",)),
+]
+
+SPECIAL_SIGNAGE_LABEL_ORDER = [label for label, _ in SPECIAL_SIGNAGE_LABELS]
+
 # Page / layout constants
 MARGIN_L = 72
 MARGIN_R = 72
@@ -770,6 +781,7 @@ def _line_height(fontsize: float, leading: float = LEADING) -> float:
     return fontsize * leading
 
 def draw_wrapped_text(out_doc, page, x, y, text, max_width, fontsize=12, leading=LEADING, color=(0,0,0)):
+    x_start = x
     paragraphs = str(text).splitlines() if text else [""]
     for para in paragraphs:
         words = para.split(" ")
@@ -782,9 +794,19 @@ def draw_wrapped_text(out_doc, page, x, y, text, max_width, fontsize=12, leading
                 words.pop(0)
                 if words:
                     continue
+            else:
+                if not line:
+                    forced = words.pop(0)
+                    trimmed = _ellipsize_to_width(forced, max_width, fontsize)
+                    if trimmed:
+                        forced = trimmed
+                    line = forced
+                else:
+                    # will flush the current line without consuming the next word
+                    pass
             if y > page.rect.y1 - MARGIN_B - _line_height(fontsize, leading):
                 page = out_doc.new_page()
-                x = MARGIN_L
+                x = x_start
                 y = MARGIN_T
             page.insert_text((x, y), line, fontsize=fontsize, color=color)
             y += _line_height(fontsize, leading)
@@ -792,7 +814,7 @@ def draw_wrapped_text(out_doc, page, x, y, text, max_width, fontsize=12, leading
         if line:
             if y > page.rect.y1 - MARGIN_B - _line_height(fontsize, leading):
                 page = out_doc.new_page()
-                x = MARGIN_L
+                x = x_start
                 y = MARGIN_T
             page.insert_text((x, y), line, fontsize=fontsize, color=color)
             y += _line_height(fontsize, leading)
@@ -871,6 +893,63 @@ def draw_multicolumn_list(out_doc, page, items, y, columns=4, fontsize=10, col_g
                 page, y = draw_wrapped_text(out_doc, page, MARGIN_L, y, header_on_new_pages, width_total, fontsize=12)
     return page, y
 
+# ----------------------------- Store helpers -----------------------------
+
+_STORE_NUM_RE = re.compile(r'[A-Z]\d{4}')
+
+def extract_store_number(store: dict) -> str:
+    for key in ("store_name", "store_id"):
+        value = store.get(key)
+        if not value:
+            continue
+        m = _STORE_NUM_RE.search(str(value))
+        if m:
+            return m.group(0)
+    meta = store.get('meta') or {}
+    value = meta.get('store', '')
+    if value:
+        m = _STORE_NUM_RE.search(str(value))
+        if m:
+            return m.group(0)
+    return store.get('store_name', '') or ''
+
+def detect_special_box_label(store: dict):
+    items = store.get('items') or []
+    if not items:
+        return None
+    types = {canon(it.get('type', '')) for it in items if it.get('type')}
+    for label, needles in SPECIAL_SIGNAGE_LABELS:
+        for needle in needles:
+            for st in types:
+                if needle in st:
+                    return label
+    return None
+
+def render_store_group(out_doc, src_doc, stores, blackout_cfg, kit_by_store_id, section_title):
+    if not stores:
+        return
+    page = out_doc.new_page()
+    page, _ = draw_heading(out_doc, page, section_title, MARGIN_T, fontsize=18)
+    current_type = None
+    for store in stores:
+        kit_name = kit_by_store_id.get(store['store_id'])
+        store_type = store.get('store_type', '')
+        if store_type != current_type:
+            current_type = store_type
+            heading = out_doc.new_page()
+            heading_text = f"Store Type: {current_type}" if current_type else "Store Type: (Unspecified)"
+            heading, _ = draw_heading(out_doc, heading, heading_text, MARGIN_T, fontsize=16)
+        for p in store['pages']:
+            out_doc.insert_pdf(src_doc, from_page=p, to_page=p)
+            pg = out_doc[-1]
+            blackout_rows_on_page(pg, blackout_cfg)
+            if store.get('drop_nonalc_wobbler'):
+                blackout_nonalc_wobbler_row_on_page(pg)
+            highlight_keyword(pg, KIT_COUNTER, (0.68, 0.85, 0.90))
+            highlight_keyword(pg, KIT_SHIPPER, (1.00, 0.71, 0.76))
+            if kit_name:
+                annotate_wobbler_kit(pg, kit_name)
+
 # ----------------------------- Safe save -----------------------------
 
 def ensure_unique_path(path: Path) -> Path:
@@ -931,8 +1010,12 @@ def process_pdf_sorted_with_kits_and_envelopes(input_file, output_file, root: tk
                 if DEBUG and s['drop_nonalc_wobbler']:
                     dbg(f"store '{s.get('store_name','?')}' -> drop Non-Alc Wobbler row")
 
+            no_order_stores = [s for s in stores if not s.get('items')]
+            stores_with_items = [s for s in stores if s.get('items')]
+            dbg(f"process: no_order_stores={len(no_order_stores)} with_items={len(stores_with_items)}")
+
             # 2) Envelope-Fit GUI
-            sign_types = unique_sign_types(stores)
+            sign_types = unique_sign_types(stores_with_items)
             if not sign_types:
                 messagebox.showerror("Envelope Fit", "No sign types found in this PDF.", parent=root)
                 dbg("process: abort no sign types")
@@ -940,7 +1023,7 @@ def process_pdf_sorted_with_kits_and_envelopes(input_file, output_file, root: tk
             fit_cfg = gui_envelope_fit(root, sign_types)
 
             # 3) Compute per-store envelope fit
-            fits, not_fits = compute_envelope_fit(stores, fit_cfg)
+            fits, not_fits = compute_envelope_fit(stores_with_items, fit_cfg)
 
             # 4) Sort each bucket
             def store_sort_key(s):
@@ -948,69 +1031,62 @@ def process_pdf_sorted_with_kits_and_envelopes(input_file, output_file, root: tk
                 return (rank, s['location'], s['store_name'])
             fits_sorted = sorted(fits, key=store_sort_key)
             not_fits_sorted = sorted(not_fits, key=store_sort_key)
-            dbg(f"process: fits_sorted={len(fits_sorted)} not_fits_sorted={len(not_fits_sorted)}")
+            box_special = {label: [] for label in SPECIAL_SIGNAGE_LABEL_ORDER}
+            box_general = []
+            for store in not_fits_sorted:
+                label = detect_special_box_label(store)
+                if label:
+                    box_special[label].append(store)
+                else:
+                    box_general.append(store)
+            box_total = len(not_fits_sorted)
+            dbg_special = {label: len(box_special[label]) for label in SPECIAL_SIGNAGE_LABEL_ORDER if box_special[label]}
+            dbg(f"process: fits_sorted={len(fits_sorted)} box_total={box_total} special={dbg_special}")
 
             # 5) Wobbler kits
-            kits, kit_by_store_id = group_wobbler_kits(stores, min_stores=10)
+            kits, kit_by_store_id = group_wobbler_kits(stores_with_items, min_stores=10)
 
             # 6) Build output
             out = fitz.open()
+
+            no_order_display = []
+            seen_no_order = set()
+            for store in no_order_stores:
+                candidate = extract_store_number(store).strip()
+                if not candidate:
+                    candidate = (store.get('store_name') or '').strip()
+                if candidate and candidate not in seen_no_order:
+                    seen_no_order.add(candidate)
+                    no_order_display.append(candidate)
+            no_order_line = ", ".join(no_order_display) if no_order_display else "None"
 
             # Summary page
             cover = out.new_page()
             y = MARGIN_T
             cover, y = draw_heading(out, cover, "Order Packaging Summary", y, fontsize=18)
+            cover, y = draw_wrapped_text(out, cover, MARGIN_L, y, f"No Order Stores: {no_order_line}", cover.rect.x1 - MARGIN_R - MARGIN_L, fontsize=12)
             cover, y = draw_label_value(out, cover, "Envelope-Fit Stores", len(fits_sorted), y, fontsize=12)
-            cover, y = draw_label_value(out, cover, "Other Stores", len(not_fits_sorted), y, fontsize=12)
+            cover, y = draw_label_value(out, cover, "Box Stores", box_total, y, fontsize=12)
+            for label in SPECIAL_SIGNAGE_LABEL_ORDER:
+                stores_for_label = box_special[label]
+                if stores_for_label:
+                    cover, y = draw_label_value(out, cover, f"{label} Box Stores", len(stores_for_label), y, fontsize=11)
             cover, y = draw_label_value(out, cover, "Wobbler Kits (10+ stores)", len(kits), y, fontsize=12)
             cover, y = draw_wrapped_text(out, cover, MARGIN_L, y, "Envelope-Fit rule: a store fits only if ALL item Sign Types are marked as 'will fit'.", cover.rect.x1 - MARGIN_R - MARGIN_L, fontsize=10)
             if DEBUG:
                 cover, y = draw_wrapped_text(out, cover, MARGIN_L, y, f"DEBUG log: {os.path.abspath(DEBUG_LOG)}", cover.rect.x1 - MARGIN_R - MARGIN_L, fontsize=8)
 
-            # Envelope-FRIENDLY orders first
-            page = out.new_page()
-            page, _ = draw_heading(out, page, "ENVELOPE-FRIENDLY ORDERS", MARGIN_T, fontsize=18)
+            # Envelope-friendly orders
+            render_store_group(out, doc, fits_sorted, blackout_cfg, kit_by_store_id, "ENVELOPE-FRIENDLY ORDERS")
 
-            current_type = None
-            for s in fits_sorted:
-                kit_name = kit_by_store_id.get(s['store_id'])
-                if s['store_type'] != current_type:
-                    current_type = s['store_type']
-                    page = out.new_page()
-                    page, _ = draw_heading(out, page, f"Store Type: {current_type}", MARGIN_T, fontsize=16)
-                for p in s['pages']:
-                    out.insert_pdf(doc, from_page=p, to_page=p)
-                    pg = out[-1]
-                    blackout_rows_on_page(pg, blackout_cfg)
-                    if s.get('drop_nonalc_wobbler'):
-                        blackout_nonalc_wobbler_row_on_page(pg)
-                    highlight_keyword(pg, KIT_COUNTER, (0.68, 0.85, 0.90))
-                    highlight_keyword(pg, KIT_SHIPPER, (1.00, 0.71, 0.76))
-                    if kit_name:
-                        annotate_wobbler_kit(pg, kit_name)
+            # Box orders (special signage categories first)
+            for label in SPECIAL_SIGNAGE_LABEL_ORDER:
+                stores_for_label = box_special[label]
+                if stores_for_label:
+                    render_store_group(out, doc, stores_for_label, blackout_cfg, kit_by_store_id, f"BOX STORES — {label}")
 
-            # Divider
-            page = out.new_page()
-            page, _ = draw_heading(out, page, "OTHER ORDERS", MARGIN_T, fontsize=18)
-
-            # Remaining orders
-            current_type = None
-            for s in not_fits_sorted:
-                kit_name = kit_by_store_id.get(s['store_id'])
-                if s['store_type'] != current_type:
-                    current_type = s['store_type']
-                    page = out.new_page()
-                    page, _ = draw_heading(out, page, f"Store Type: {current_type}", MARGIN_T, fontsize=16)
-                for p in s['pages']:
-                    out.insert_pdf(doc, from_page=p, to_page=p)
-                    pg = out[-1]
-                    blackout_rows_on_page(pg, blackout_cfg)
-                    if s.get('drop_nonalc_wobbler'):
-                        blackout_nonalc_wobbler_row_on_page(pg)
-                    highlight_keyword(pg, KIT_COUNTER, (0.68, 0.85, 0.90))
-                    highlight_keyword(pg, KIT_SHIPPER, (1.00, 0.71, 0.76))
-                    if kit_name:
-                        annotate_wobbler_kit(pg, kit_name)
+            # Remaining box orders
+            render_store_group(out, doc, box_general, blackout_cfg, kit_by_store_id, "BOX STORES")
 
             # Wobbler kits appendix (summary + details)
             cover2 = out.new_page()
@@ -1054,7 +1130,7 @@ def process_pdf_sorted_with_kits_and_envelopes(input_file, output_file, root: tk
     dt = time.time() - t0
     dbg(f"process: done in {dt:.2f}s")
     messagebox.showinfo("Complete",
-                        f"Saved: {out_path}\nEnvelope-Fit Stores: {len(fits_sorted)}\nOther Stores: {len(not_fits_sorted)}\nWobbler Kits (10+): {len(kits)}",
+                        f"Saved: {out_path}\nEnvelope-Fit Stores: {len(fits_sorted)}\nBox Stores: {box_total}\nNo Order Stores: {len(no_order_stores)}\nWobbler Kits (10+): {len(kits)}",
                         parent=root)
 
 # ----------------------------- App wiring -----------------------------
